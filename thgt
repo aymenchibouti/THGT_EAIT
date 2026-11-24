@@ -1,0 +1,1509 @@
+# -*- coding: utf-8 -*-
+"""
+=====================================================================================
+ THGT v5 (calendar-aligned siblings) — Temporal Heterogeneous Graph Transformer for MOOC dropout prediction
+ Publication-grade pipeline (KDD Cup 2015)
+ Inputs : log_train.csv|zip (raw clickstream) + merged_AB_processed.csv(.gz) (labels/splits/features)
+=====================================================================================
+v4 = v3 + all reviewer-oriented fixes:
+  * training     : EMA decay 0.995 (shorter horizon), 12 epochs, warmup+cosine, selective weight decay
+  * new ablation : w/o heterogeneity (homogeneous graph transformer, same graph)  -> isolates HGT typing
+  * calibration  : temperature scaling fitted on validation; ECE/Brier/log-loss before & after
+  * statistics   : DeLong + paired-bootstrap 95% CI of ΔAUC + Holm correction (per family)
+  * subgroups    : multi- vs single-course learners, activity tertiles, per-course AUC + Wilcoxon
+  * attribution  : inference-time node-type / event-type occlusion (ΔAUC), all seeds
+  * attention    : seed-averaged (mean ± std)
+  * efficiency   : parameters, s/epoch, inference ms per 1k enrollments
+  * figures      : architecture diagram (PNG+PDF) and all result figures in PNG+PDF
+  * tables       : CSV + LaTeX in tables/, full report in results.md
+
+Experiments (3 seeds each): full, causal, no_graph, no_hetero, no_objects, no_siblings
+Baselines: LightGBM (439 engineered features), Causal-LightGBM per horizon, ensembles.
+
+Kaggle (GPU):  !python thgt_v4_paper.py                 (~2.5 h, resumable: runs/ are cached)
+               !python thgt_v4_paper.py --seeds 0       (quick)
+               !python thgt_v4_paper.py --debug         (smoke test)
+=====================================================================================
+"""
+
+import os, glob, json, math, time, random, argparse, warnings, copy, gc
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pandas.api.types import union_categoricals
+from scipy.stats import rankdata, norm
+from sklearn.metrics import (roc_auc_score, average_precision_score, f1_score, accuracy_score,
+                             log_loss, precision_score, recall_score, brier_score_loss)
+
+warnings.filterwarnings("ignore")
+
+ACTS = ["access", "discussion", "navigate", "page_close", "problem", "video", "wiki"]
+NDAYS = 30
+T_ENR, T_USER, T_COURSE, T_EVT, T_OBJ, T_SIB = range(6)
+N_TYPES = 6
+TYPE_NAMES = ["enrollment", "user", "course", "event_type", "object", "sibling"]
+
+EXPERIMENTS = {
+    "full":        dict(name="THGT-Full",            flags=dict()),
+    "causal":      dict(name="THGT-Causal",          flags=dict(no_static=True)),
+    "no_graph":    dict(name="w/o Graph (Temporal only)", flags=dict(no_static=True, no_graph=True)),
+    "no_objects":  dict(name="w/o Object nodes",     flags=dict(no_static=True, no_objects=True)),
+    "no_siblings": dict(name="w/o Sibling enrollments", flags=dict(no_static=True, no_siblings=True)),
+    "no_hetero":   dict(name="w/o Heterogeneity (homogeneous GT)", flags=dict(no_static=True, no_hetero=True)),
+}
+KEEP_STATE = {"full", "causal"}          # checkpoints kept for occlusion / attention analysis
+
+
+# ==================================================================================
+# 0. Config / utils
+# ==================================================================================
+def get_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--log", type=str, default="")
+    p.add_argument("--merged", type=str, default="")
+    p.add_argument("--out", type=str, default="")
+    p.add_argument("--fig_formats", type=str, default="pdf",
+                   help="comma-separated figure formats, e.g. 'pdf' (default, vector) or 'pdf,png'")
+    p.add_argument("--sib_align", type=str, default="calendar", choices=["calendar", "course"])
+    p.add_argument("--exps", type=str, default="full,causal,no_graph,no_objects,no_siblings,no_hetero")
+    p.add_argument("--seeds", type=str, default="0,1,2")
+    # training
+    p.add_argument("--epochs", type=int, default=12)
+    p.add_argument("--batch", type=int, default=512)
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--wd", type=float, default=1e-3)
+    p.add_argument("--warmup", type=float, default=0.1)
+    p.add_argument("--ema", type=float, default=0.995)
+    p.add_argument("--patience", type=int, default=4)
+    p.add_argument("--aux_w", type=float, default=0.3)
+    # architecture
+    p.add_argument("--d", type=int, default=128)
+    p.add_argument("--heads", type=int, default=4)
+    p.add_argument("--day_layers", type=int, default=2)
+    p.add_argument("--graph_layers", type=int, default=2)
+    p.add_argument("--snap_layers", type=int, default=2)
+    p.add_argument("--dropout", type=float, default=0.25)
+    # graph
+    p.add_argument("--snap_every", type=int, default=5, choices=[3, 5, 6, 10, 15])
+    p.add_argument("--max_obj", type=int, default=12)
+    p.add_argument("--max_sib", type=int, default=8)
+    p.add_argument("--min_obj_enr", type=int, default=5)
+    p.add_argument("--obj_drop", type=float, default=0.1)
+    # baselines / stats
+    p.add_argument("--skip_lgb", action="store_true")
+    p.add_argument("--skip_causal_lgb", action="store_true")
+    p.add_argument("--lgb_threads", type=int, default=0)
+    p.add_argument("--n_boot", type=int, default=1000)
+    p.add_argument("--skip_occlusion", action="store_true")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--max_enroll", type=int, default=0)
+    args, _ = p.parse_known_args()
+    args.no_static = args.no_graph = args.no_objects = args.no_siblings = args.no_hetero = False
+    if args.debug:
+        args.max_enroll = args.max_enroll or 6000
+        args.epochs = min(args.epochs, 2)
+        args.n_boot = min(args.n_boot, 100)
+        args.d = min(args.d, 64)
+    return args
+
+
+def find_file(hint, patterns):
+    if hint and os.path.exists(hint):
+        return hint
+    for pt in patterns:
+        hits = [h for h in sorted(glob.glob(pt, recursive=True)) if os.path.isfile(h)]
+        if hits:
+            return hits[0]
+    raise FileNotFoundError(f"not found: {patterns}")
+
+
+def seed_all(s):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+
+
+def log1p(x):
+    return np.log1p(x).astype(np.float32)
+
+
+# ==================================================================================
+# 1. Raw logs → temporal heterogeneous graph tensors
+# ==================================================================================
+def read_logs(path, keep_eids=None, chunksize=2_000_000):
+    ev_map = {a: i for i, a in enumerate(ACTS)}
+    parts, objs = [], []
+    t0 = time.time()
+    reader = pd.read_csv(path, chunksize=chunksize, usecols=["enrollment_id", "time", "source", "event", "object"],
+                         dtype={"enrollment_id": np.int32, "time": str, "source": str, "event": str, "object": str})
+    for ch in reader:
+        if keep_eids is not None:
+            ch = ch[ch["enrollment_id"].isin(keep_eids)]
+        if len(ch) == 0:
+            continue
+        ts = pd.to_datetime(ch["time"], format="%Y-%m-%dT%H:%M:%S", errors="coerce")
+        ok = ts.notna().values & ch["event"].isin(ev_map).values
+        ch, ts = ch[ok], ts[ok]
+        parts.append(dict(
+            eid=ch["enrollment_id"].values.astype(np.int32),
+            t=(ts.values.astype("datetime64[s]").astype(np.int64)),
+            src=(ch["source"].values == "browser").astype(np.int8),
+            ev=ch["event"].map(ev_map).values.astype(np.int8)))
+        objs.append(pd.Categorical(ch["object"].fillna("NA").values))
+        print(f"   read {sum(len(p['eid']) for p in parts):,} events  ({time.time()-t0:.0f}s)")
+    obj = union_categoricals(objs)
+    L = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
+    L["obj"] = obj.codes.astype(np.int32)
+    L["n_obj"] = len(obj.categories)
+    return L
+
+
+def build_graph(logs, meta_df, args):
+    S_E = args.snap_every
+    S = NDAYS // S_E
+    M, K = args.max_obj, args.max_sib
+    N = len(meta_df)
+    O = logs["n_obj"]
+
+    eid2row = np.full(int(max(meta_df.enrollment_id.max(), logs["eid"].max())) + 1, -1, np.int64)
+    eid2row[meta_df.enrollment_id.values] = np.arange(N)
+    row = eid2row[logs["eid"]]
+    keep = row >= 0
+    row = row[keep]; t = logs["t"][keep]; src = logs["src"][keep]; ev = logs["ev"][keep].astype(np.int64)
+    obj = logs["obj"][keep].astype(np.int64)
+    del logs
+
+    course_row = meta_df["course"].values.astype(np.int64)
+    C = int(course_row.max()) + 1
+    is_train = (meta_df["_split"].values == "train")
+    crs = course_row[row]
+
+    # ---- course-relative day ----
+    dayabs = t // 86400
+    cstart = np.full(C, np.iinfo(np.int64).max); np.minimum.at(cstart, crs, dayabs)
+    d = np.clip(dayabs - cstart[crs], 0, NDAYS - 1)
+    hour = (t % 86400) // 3600
+    w = d // S_E
+    snap_days = [(s + 1) * S_E for s in range(S)]
+
+    # ---- sessions (30-min gap) ----
+    order = np.lexsort((t, row))
+    r_s, t_s, d_s = row[order], t[order], d[order]
+    gap = np.diff(t_s, prepend=t_s[0])
+    new = np.ones(len(r_s), bool); new[1:] = (r_s[1:] != r_s[:-1]) | (gap[1:] > 1800)
+    dur = np.where(new, 0, gap).astype(np.float64)
+    key_s = r_s * NDAYS + d_s
+    sessions = np.bincount(key_s[new], minlength=N * NDAYS).reshape(N, NDAYS)
+    duration = np.bincount(key_s, weights=dur, minlength=N * NDAYS).reshape(N, NDAYS) / 60.0
+    del order, r_s, t_s, d_s, gap, new, dur, key_s
+
+    # ---- object metadata ----
+    obj_course = np.zeros(O, np.int64); obj_course[obj] = crs
+    obj_type = np.bincount(obj * 7 + ev, minlength=O * 7).reshape(O, 7).argmax(1)
+    obj_rel = np.full(O, NDAYS - 1, np.int64); np.minimum.at(obj_rel, obj, d)
+    seen = np.zeros(O, bool); seen[obj] = True
+
+    # ---- daily features (N,30,F) ----
+    key = row * NDAYS + d
+    evc = np.bincount(key * 7 + ev, minlength=N * NDAYS * 7).reshape(N, NDAYS, 7)
+    tot = evc.sum(-1)
+    bro = np.bincount(key[src == 1], minlength=N * NDAYS).reshape(N, NDAYS)
+    uk = np.unique(key * O + obj)
+    uobj = np.bincount(uk // O, minlength=N * NDAYS).reshape(N, NDAYS); del uk
+    hk = np.unique(key * 24 + hour)
+    ahours = np.bincount(hk // 24, minlength=N * NDAYS).reshape(N, NDAYS); del hk
+    rel_cd = np.bincount(obj_course[seen] * NDAYS + obj_rel[seen], minlength=C * NDAYS).reshape(C, NDAYS)
+    dow = (cstart[course_row][:, None] + np.arange(NDAYS)[None] + 3) % 7        # 0 = Monday
+    day = np.concatenate([
+        log1p(evc), log1p(tot)[..., None], log1p(uobj)[..., None],
+        (bro / np.maximum(tot, 1)).astype(np.float32)[..., None],
+        (ahours / 24.0).astype(np.float32)[..., None],
+        log1p(sessions)[..., None], log1p(duration)[..., None],
+        (tot > 0).astype(np.float32)[..., None],
+        log1p(rel_cd[course_row])[..., None],
+        np.sin(2 * np.pi * dow / 7).astype(np.float32)[..., None],
+        np.cos(2 * np.pi * dow / 7).astype(np.float32)[..., None]], -1).astype(np.float32)
+    mu = day[is_train].reshape(-1, day.shape[-1]).mean(0)
+    sd = day[is_train].reshape(-1, day.shape[-1]).std(0) + 1e-6
+    day = (day - mu) / sd
+    active = tot > 0
+    del bro, uobj, ahours, sessions, duration
+
+    # ---- window (snapshot) event-type features (N,S,7,3) ----
+    evw_cnt = evc.reshape(N, S, S_E, 7).sum(2)
+    bro_ev = np.bincount((row * S + w) * 7 + ev, weights=src.astype(np.float64),
+                         minlength=N * S * 7).reshape(N, S, 7)
+    # unique objects per window & object ranking
+    rw = row * S + w
+    k2, cnt2 = np.unique(rw * O + obj, return_counts=True)
+    rw2, o2 = k2 // O, k2 % O
+    del k2
+    uobj_ev = np.bincount(rw2 * 7 + obj_type[o2], minlength=N * S * 7).reshape(N, S, 7)
+    evw = np.stack([log1p(evw_cnt), log1p(uobj_ev),
+                    (bro_ev / np.maximum(evw_cnt, 1)).astype(np.float32)], -1).astype(np.float32)
+    del bro_ev, uobj_ev, evc
+
+    # top-M objects per (row, window)
+    ordr = np.lexsort((-cnt2, rw2))
+    rw2, o2, cnt2 = rw2[ordr], o2[ordr], cnt2[ordr]
+    first = np.r_[0, np.flatnonzero(np.diff(rw2)) + 1]
+    rank = np.arange(len(rw2)) - np.repeat(first, np.diff(np.r_[first, len(rw2)]))
+    sel = rank < M
+    obj_tok = -np.ones((N * S, M), np.int32)
+    obj_cnt = np.zeros((N * S, M), np.float32)
+    obj_tok[rw2[sel], rank[sel]] = o2[sel]
+    obj_cnt[rw2[sel], rank[sel]] = np.log1p(cnt2[sel])
+    obj_tok = obj_tok.reshape(N, S, M); obj_cnt = obj_cnt.reshape(N, S, M)
+
+    # object vocab & causal popularity (train enrollments only, no labels)
+    tr_mask = is_train[rw2 // S]
+    pr = np.unique((rw2[tr_mask] // S) * O + o2[tr_mask])          # train (row,obj) pairs
+    n_tr_enr_obj = np.bincount(pr % O, minlength=O)
+    vocab = np.zeros(O, np.int64)
+    good = n_tr_enr_obj >= args.min_obj_enr
+    vocab[good] = np.arange(1, good.sum() + 1)
+    # first window each train (row,obj) is seen → cumulative popularity
+    tr_rw, tr_o = rw2[tr_mask], o2[tr_mask]
+    fk = (tr_rw // S) * O + tr_o
+    o3 = np.lexsort((tr_rw % S, fk))
+    fk_s, win_s = fk[o3], (tr_rw % S)[o3]
+    fsel = np.r_[True, fk_s[1:] != fk_s[:-1]]
+    pop = np.bincount((fk_s[fsel] % O) * S + win_s[fsel], minlength=O * S).reshape(O, S).cumsum(1)
+    ctrain = np.bincount(course_row[is_train], minlength=C).astype(np.float64)
+    pop = (pop / np.maximum(ctrain[obj_course], 1)[:, None]).astype(np.float32)
+    del rw2, o2, cnt2, rank, sel, pr, tr_rw, tr_o, fk, o3, fk_s, win_s, fsel, rw
+
+    # ---- course snapshot features (C,S,5) ----
+    act_w = active.reshape(N, S, S_E).any(2)
+    cnt_w = np.log1p(tot.reshape(N, S, S_E).sum(2))
+    cf = np.zeros((C, S, 5), np.float32)
+    rel_w = rel_cd.reshape(C, S, S_E).sum(2)
+    for c in range(C):
+        m = is_train & (course_row == c)
+        if m.sum() == 0:
+            m = course_row == c
+        cf[c, :, 0] = act_w[m].mean(0)
+        cf[c, :, 1] = cnt_w[m].mean(0)
+    cf[:, :, 2] = np.log1p(rel_w)
+    cf[:, :, 3] = rel_w.cumsum(1) / np.maximum(rel_w.sum(1, keepdims=True), 1)
+    cf[:, :, 4] = np.log1p(ctrain)[:, None]
+    cf = (cf - cf.reshape(-1, 5).mean(0)) / (cf.reshape(-1, 5).std(0) + 1e-6)
+    del tot, active, act_w, cnt_w
+
+    # ---- siblings (same user, other courses) ----
+    sib = -np.ones((N, K), np.int64)
+    rng = np.random.RandomState(0)
+    if not args.no_siblings:
+        for _, idx in meta_df.groupby("user").indices.items():
+            if len(idx) < 2:
+                continue
+            for i in idx:
+                o = idx[idx != i]
+                if len(o) > K:
+                    o = rng.choice(o, K, replace=False)
+                sib[i, :len(o)] = o
+    # ---- v5: calendar alignment of sibling enrollments ----
+    # Target snapshot s ends on calendar day cstart[c_i] + d_s - 1.  A sibling j may only
+    # contribute days whose calendar date is <= that day, i.e. sibling course-day index
+    # t_j <= d_s - 1 - (cstart[c_j] - cstart[c_i]).  Siblings whose course starts later
+    # are masked until they have visible days; this removes calendar look-ahead.
+    snap_arr = np.array(snap_days, np.int64)
+    sib_ok = sib >= 0
+    off = np.zeros((N, K), np.int64)
+    ii = np.nonzero(sib_ok)
+    off[ii] = cstart[course_row[sib[ii]]] - cstart[course_row[ii[0]]]
+    n_vis = snap_arr[None, None, :] - off[..., None]                       # (N,K,S) visible sibling days
+    if getattr(args, "sib_align", "calendar") == "course":                # v4 behaviour (for comparison)
+        n_vis = np.broadcast_to(snap_arr[None, None, :], (N, K, S)).copy()
+    sib_didx = (np.clip(n_vis, 1, NDAYS) - 1).astype(np.int16)
+    sib_vis = (n_vis >= 1) & sib_ok[..., None]
+    print(f"[siblings] align={getattr(args, 'sib_align', 'calendar')} | pairs {int(sib_ok.sum()):,} | "
+          f"later-starting {float((off[sib_ok] > 0).mean()):.3f} | visible share by snapshot "
+          f"{np.round(sib_vis.sum((0, 1)) / max(sib_ok.sum(), 1), 3).tolist()}")
+    n_enr_user = meta_df.groupby("user")["user"].transform("size").values
+    userf = np.stack([np.log1p(n_enr_user), (sib >= 0).sum(1) / K], 1).astype(np.float32)
+
+    # ---- static tabular features (full period, optional) ----
+    drop = {"enrollment_id", "user", "course", "_split", "target"}
+    scols = [c for c in meta_df.columns if c not in drop]
+    static = np.nan_to_num(meta_df[scols].values.astype(np.float32))
+
+    T = dict(day=day, evw=evw, obj_tok=obj_tok, obj_cnt=obj_cnt, course=course_row, sib=sib,
+             sib_didx=sib_didx, sib_vis=sib_vis,
+             userf=userf, static=static, y=meta_df["target"].values.astype(np.float32),
+             cf=cf, pop=pop, vocab=vocab, obj_type=obj_type, obj_rel=obj_rel.astype(np.float32),
+             split=np.array([{"train": 0, "val": 1, "test": 2}[s] for s in meta_df["_split"].values], np.int8),
+             enrollment_id=meta_df["enrollment_id"].values)
+    info = dict(S=S, snap_days=snap_days, n_course=C, n_obj=O, n_vocab=int(good.sum()) + 1,
+                n_day_feat=day.shape[-1], n_static=static.shape[1], M=M, K=K, snap_every=S_E)
+    return T, info
+
+
+# ==================================================================================
+# 2. Model
+# ==================================================================================
+class TypedLinear(nn.Module):
+    def __init__(self, n_types, d_in, d_out):
+        super().__init__()
+        self.W = nn.Parameter(torch.empty(n_types, d_out, d_in))
+        self.b = nn.Parameter(torch.zeros(n_types, d_out))
+        for i in range(n_types):
+            nn.init.xavier_uniform_(self.W[i])
+
+    def forward(self, x, types):
+        return torch.einsum("bld,lod->blo", x, self.W[types]) + self.b[types]
+
+
+class HGTLayer(nn.Module):
+    def __init__(self, d, heads, dropout):
+        super().__init__()
+        self.h, self.dk = heads, d // heads
+        self.q = TypedLinear(N_TYPES, d, d)
+        self.k = TypedLinear(N_TYPES, d, d)
+        self.v = TypedLinear(N_TYPES, d, d)
+        self.o = TypedLinear(N_TYPES, d, d)
+        self.mu = nn.Parameter(torch.ones(heads, N_TYPES, N_TYPES))
+        self.rb = nn.Parameter(torch.zeros(heads, N_TYPES, N_TYPES))
+        self.ew = nn.Parameter(torch.full((heads,), 0.1))             # edge-weight bias scale
+        self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.ff = nn.Sequential(nn.Linear(d, 2 * d), nn.GELU(), nn.Dropout(dropout), nn.Linear(2 * d, d))
+        self.drop = nn.Dropout(dropout)
+        self.last_attn = None
+
+    def forward(self, x, types, adj, ew, keep_attn=False):
+        B, L, _ = x.shape
+        hx = self.n1(x)
+        q = self.q(hx, types).view(B, L, self.h, self.dk).transpose(1, 2).float()
+        k = self.k(hx, types).view(B, L, self.h, self.dk).transpose(1, 2).float()
+        v = self.v(hx, types).view(B, L, self.h, self.dk).transpose(1, 2)
+        att = (q @ k.transpose(-1, -2)) / math.sqrt(self.dk)
+        att = att * self.mu[:, types][:, :, types].float() + self.rb[:, types][:, :, types].float()
+        att = att + self.ew.float()[None, :, None, None] * ew[:, None]
+        att = torch.softmax(att.masked_fill(~adj[:, None], -1e9), -1)
+        if keep_attn:
+            self.last_attn = att.detach()
+        out = (self.drop(att).to(v.dtype) @ v).transpose(1, 2).reshape(B, L, -1)
+        x = x + self.drop(self.o(out, types))
+        return x + self.drop(self.ff(self.n2(x)))
+
+
+def causal_mask(L, dev):
+    return torch.triu(torch.ones(L, L, dtype=torch.bool, device=dev), 1)
+
+
+def tf_encoder(d, heads, layers, dropout):
+    el = nn.TransformerEncoderLayer(d, heads, 2 * d, dropout, batch_first=True, norm_first=True, activation="gelu")
+    return nn.TransformerEncoder(el, layers, enable_nested_tensor=False)
+
+
+class THGTv2(nn.Module):
+    def __init__(self, info, args):
+        super().__init__()
+        d, S, M, K = args.d, info["S"], info["M"], info["K"]
+        self.args, self.S, self.M, self.K = args, S, M, K
+        self.register_buffer("snap_idx", torch.tensor([x - 1 for x in info["snap_days"]]), persistent=False)
+        self.register_buffer("snap_day", torch.tensor(info["snap_days"], dtype=torch.float32), persistent=False)
+
+        self.day_in = nn.Sequential(nn.Linear(info["n_day_feat"], d), nn.GELU(), nn.Linear(d, d))
+        self.day_pos = nn.Parameter(torch.randn(1, NDAYS, d) * 0.02)
+        self.day_enc = tf_encoder(d, args.heads, args.day_layers, args.dropout)
+        self.day_norm = nn.LayerNorm(d)
+
+        self.type_emb = nn.Embedding(N_TYPES, d)
+        self.snap_emb = nn.Embedding(S, d)
+        self.user_in = nn.Linear(2, d)
+        self.course_emb = nn.Embedding(info["n_course"], d)
+        self.course_in = nn.Linear(5, d)
+        self.evt_emb = nn.Embedding(7, d)
+        self.evt_in = nn.Sequential(nn.Linear(3, d), nn.LayerNorm(d))
+        self.obj_emb = nn.Embedding(info["n_vocab"], d)
+        self.obj_in = nn.Sequential(nn.Linear(4, d), nn.LayerNorm(d))
+
+        self.graph = nn.ModuleList([HGTLayer(d, args.heads, args.dropout) for _ in range(args.graph_layers)])
+        self.g_norm = nn.LayerNorm(d)
+
+        self.e0, self.o0 = 3, 10
+        self.s0 = self.o0 + M
+        L = self.s0 + K
+        self.L = L
+        types = [T_ENR, T_USER, T_COURSE] + [T_EVT] * 7 + [T_OBJ] * M + [T_SIB] * K
+        self.register_buffer("types", torch.tensor(types), persistent=False)
+        ltypes = torch.zeros(L, dtype=torch.long) if getattr(args, "no_hetero", False) else torch.tensor(types)
+        self.register_buffer("ltypes", ltypes, persistent=False)   # types seen by HGT parameters
+        A = torch.zeros(L, L, dtype=torch.bool)
+        e0, o0, s0 = self.e0, self.o0, self.s0
+        A[0, :] = A[:, 0] = True
+        A[1, s0:] = A[s0:, 1] = True
+        A[2, e0:s0] = A[e0:s0, 2] = True            # course ↔ event types & objects
+        A |= torch.eye(L, dtype=torch.bool)
+        if args.no_graph:
+            A = torch.eye(L, dtype=torch.bool)
+        self.register_buffer("A", A, persistent=False)
+
+        self.snap_pos = nn.Parameter(torch.randn(1, S, d) * 0.02)
+        self.snap_enc = tf_encoder(d, args.heads, args.snap_layers, args.dropout)
+        self.snap_norm = nn.LayerNorm(d)
+        self.early_head = nn.Linear(d, 1)
+
+        self.use_static = not args.no_static
+        if self.use_static:
+            self.static = nn.Sequential(nn.Linear(info["n_static"], 2 * d), nn.BatchNorm1d(2 * d), nn.GELU(),
+                                        nn.Dropout(args.dropout), nn.Linear(2 * d, d), nn.GELU())
+        self.head = nn.Sequential(nn.Linear(d * (3 if self.use_static else 2), d), nn.GELU(),
+                                  nn.Dropout(args.dropout), nn.Linear(d, 1))
+
+    def forward(self, b, keep_attn=False):
+        B, K, S, M = b["day"].shape[0], self.K, self.S, self.M
+        d = self.day_pos.shape[-1]
+        dev = b["day"].device
+        te = self.type_emb.weight
+
+        # 1) day-level temporal encoder (target + siblings)
+        x = torch.cat([b["day"][:, None], b["sib_day"]], 1).reshape(B * (1 + K), NDAYS, -1)
+        H = self.day_norm(self.day_enc(self.day_in(x) + self.day_pos, mask=causal_mask(NDAYS, dev)))
+        H = H.view(B, 1 + K, NDAYS, d)
+        Hs = torch.gather(H[:, 1:], 2, b["sib_didx"][..., None].expand(-1, -1, -1, d))   # (B,K,S,d) calendar-aligned
+        H = torch.cat([H[:, :1, self.snap_idx], Hs], 1)                            # (B,1+K,S,d)
+
+        # 2) snapshot tokens
+        enr = (H[:, 0] + te[T_ENR])[:, :, None]
+        usr = (self.user_in(b["userf"]) + te[T_USER])[:, None, None].expand(B, S, 1, d)
+        crs = (self.course_emb(b["course"])[:, None] + self.course_in(b["cf"]) + te[T_COURSE])[:, :, None]
+        evt = self.evt_emb.weight[None, None] + self.evt_in(b["evw"]) + te[T_EVT]            # (B,S,7,d)
+        age = (self.snap_day[None, :, None] - b["obj_rel"]) / NDAYS
+        of = torch.stack([b["obj_cnt"], b["obj_pop"], b["obj_rel"] / NDAYS, age], -1)
+        obj = (self.obj_emb(b["obj_vocab"]) + self.obj_in(of) + self.evt_emb(b["obj_type"])
+               + self.course_emb(b["course"])[:, None, None] + te[T_OBJ])                    # (B,S,M,d)
+        sib = H[:, 1:].transpose(1, 2) + self.course_emb(b["sib_course"])[:, None] + te[T_SIB]
+        tok = torch.cat([enr, usr, crs, evt, obj, sib], 2) + self.snap_emb.weight[None, :, None]
+        L = tok.shape[2]
+        x = tok.reshape(B * S, L, d)
+
+        # adjacency (dynamic parts: object validity & object→event-type links)
+        e0, o0, s0 = self.e0, self.o0, self.s0
+        valid = torch.ones(B, S, L, dtype=torch.bool, device=dev)
+        valid[:, :, o0:s0] = b["obj_valid"]
+        valid[:, :, s0:] = b["sib_vis"].transpose(1, 2)
+        for nm in b.get("occl", ()):                         # inference-time node-type occlusion
+            if nm == "user": valid[:, :, 1] = False
+            elif nm == "course": valid[:, :, 2] = False
+            elif nm == "event_type": valid[:, :, e0:o0] = False
+            elif nm == "object": valid[:, :, o0:s0] = False
+            elif nm == "sibling": valid[:, :, s0:] = False
+            elif nm.startswith("evt:"): valid[:, :, e0 + int(nm[4:])] = False
+        adj = self.A[None, None].expand(B, S, L, L).clone()
+        if not self.args.no_graph:
+            oh = F.one_hot(b["obj_type"], 7).bool() & b["obj_valid"][..., None]          # (B,S,M,7)
+            adj[:, :, o0:s0, e0:o0] = oh
+            adj[:, :, e0:o0, o0:s0] = oh.transpose(-1, -2)
+        adj = adj & valid[:, :, None, :]
+        adj = (adj | torch.eye(L, dtype=torch.bool, device=dev)).reshape(B * S, L, L)
+
+        ew = torch.zeros(B, S, L, L, device=dev)
+        ew[:, :, 0, e0:o0] = b["evw_raw"]; ew[:, :, e0:o0, 0] = b["evw_raw"]
+        ew[:, :, 0, o0:s0] = b["obj_cnt"]; ew[:, :, o0:s0, 0] = b["obj_cnt"]
+        ew = ew.reshape(B * S, L, L)
+
+        for layer in self.graph:
+            x = layer(x, self.ltypes, adj, ew, keep_attn)
+        z = self.g_norm(x[:, 0]).view(B, S, d)
+
+        # 3) snapshot temporal encoder (causal)
+        zt = self.snap_norm(self.snap_enc(z + self.snap_pos, mask=causal_mask(S, dev)))
+        early = self.early_head(zt).squeeze(-1)
+        feats = [zt[:, -1], zt.mean(1)]
+        if self.use_static:
+            feats.append(self.static(b["static"]))
+        return self.head(torch.cat(feats, -1)).squeeze(-1), early, z
+
+
+
+
+# ==================================================================================
+# 3. GPU batching & training
+# ==================================================================================
+class GPUData:
+    def __init__(self, T, info, device):
+        keys = ["day", "evw", "obj_tok", "obj_cnt", "course", "sib", "userf", "static", "y",
+                "cf", "pop", "vocab", "obj_type", "obj_rel", "sib_didx", "sib_vis"]
+        self.t = {k: torch.as_tensor(T[k]).to(device) for k in keys}
+        self.t["obj_tok"] = self.t["obj_tok"].long()
+        self.t["sib_didx"] = self.t["sib_didx"].long()
+        self.S, self.dev = info["S"], device
+
+    def batch(self, idx, args, train=False, occl=()):
+        t, S = self.t, self.S
+        sib = t["sib"][idx]; sv = sib >= 0; sc = sib.clamp(min=0)
+        if args.no_siblings:
+            sv = torch.zeros_like(sv)
+        c = t["course"][idx]
+        o = t["obj_tok"][idx]; ov = o >= 0; oc = o.clamp(min=0)
+        if args.no_objects:
+            ov = torch.zeros_like(ov)
+        voc = t["vocab"][oc] * ov
+        if train and args.obj_drop > 0:
+            voc = voc * (torch.rand(voc.shape, device=self.dev) > args.obj_drop)
+        sidx = torch.arange(S, device=self.dev)[None, :, None].expand_as(oc)
+        evw = t["evw"][idx]
+        return dict(
+            day=t["day"][idx], sib_day=t["day"][sc] * sv[..., None, None], sib_valid=sv,
+            sib_didx=t["sib_didx"][idx], sib_vis=t["sib_vis"][idx] & sv[..., None],
+            sib_course=t["course"][sc], userf=t["userf"][idx], course=c, cf=t["cf"][c],
+            evw=evw, evw_raw=evw[..., 0],
+            obj_valid=ov, obj_vocab=voc, obj_type=t["obj_type"][oc], obj_rel=t["obj_rel"][oc] * ov,
+            obj_pop=t["pop"][oc, sidx] * ov, obj_cnt=t["obj_cnt"][idx] * ov,
+            static=t["static"][idx], y=t["y"][idx], occl=occl)
+
+
+def run_epoch(model, data, idx_all, args, opt=None, sched=None, scaler=None, ema=None, keep_attn=False, occl=()):
+    train = opt is not None
+    model.train(train)
+    dev = data.dev
+    if train:
+        idx_all = idx_all[torch.randperm(len(idx_all), device=dev)]
+    P, E, Z, loss_sum = [], [], [], 0.0
+    type_att = evt_att = None
+    amp = dev.type == "cuda"
+    for i in range(0, len(idx_all), args.batch):
+        idx = idx_all[i:i + args.batch]
+        if train and len(idx) < 2:
+            continue
+        b = data.batch(idx, args, train, occl)
+        with torch.set_grad_enabled(train), torch.autocast(dev.type, dtype=torch.float16, enabled=amp):
+            logit, early, z = model(b, keep_attn=keep_attn)
+            loss = F.binary_cross_entropy_with_logits(logit.float(), b["y"])
+            aux = F.binary_cross_entropy_with_logits(early.float(), b["y"][:, None].expand_as(early))
+            tot = loss + args.aux_w * aux
+        if train:
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(tot).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt); scaler.update(); sched.step()
+            if ema is not None:
+                ema.update_parameters(model)
+        else:
+            P.append(torch.sigmoid(logit.float()).cpu()); E.append(torch.sigmoid(early.float()).cpu())
+            if keep_attn:
+                Z.append(z.float().cpu())
+                row = model.graph[-1].last_attn[:, :, 0].mean(1).view(len(idx), model.S, -1)
+                pt = torch.zeros(len(idx), model.S, N_TYPES, device=dev)
+                pt.index_add_(2, model.types, row)
+                ea = row[:, :, model.e0:model.o0]
+                type_att = pt.sum(0) if type_att is None else type_att + pt.sum(0)
+                evt_att = ea.sum(0) if evt_att is None else evt_att + ea.sum(0)
+        loss_sum += loss.item() * len(idx)
+    out = dict(loss=loss_sum / max(len(idx_all), 1))
+    if not train:
+        out.update(p=torch.cat(P).numpy(), early=torch.cat(E).numpy())
+        if keep_attn:
+            out["z"] = torch.cat(Z).numpy().astype(np.float16)
+            out["type_att"] = (type_att / type_att.sum(-1, keepdim=True)).cpu().numpy()
+            out["evt_att"] = (evt_att / evt_att.sum(-1, keepdim=True)).cpu().numpy()
+    return out
+
+
+def param_groups(model, wd):
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim < 2 or any(k in n for k in ["emb", "pos", ".mu", ".rb", ".ew", "norm"]):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [dict(params=decay, weight_decay=wd), dict(params=no_decay, weight_decay=0.0)]
+
+
+def train_run(exp_key, seed, info, data, idx, yv, base_args, run_dir, keep_attn=False):
+    path = os.path.join(run_dir, f"{exp_key}_s{seed}.npz")
+    if os.path.exists(path):
+        print(f"  [skip] {path} exists")
+        z = np.load(path, allow_pickle=True)
+        return {k: z[k] for k in z.files}
+    from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+    args = copy.copy(base_args)
+    for k, v in EXPERIMENTS[exp_key]["flags"].items():
+        setattr(args, k, v)
+    seed_all(seed)
+    dev = data.dev
+    model = THGTv2(info, args).to(dev)
+    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(args.ema), use_buffers=True)
+    opt = torch.optim.AdamW(param_groups(model, args.wd), lr=args.lr)
+    spe = math.ceil(len(idx["train"]) / args.batch)
+    total, warm = args.epochs * spe, max(1, int(args.warmup * args.epochs * spe))
+
+    def lr_lambda(step):
+        if step < warm:
+            return (step + 1) / warm
+        prog = min(1.0, (step - warm) / max(1, total - warm))
+        return 0.02 + 0.98 * 0.5 * (1 + math.cos(math.pi * prog))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    scaler = torch.amp.GradScaler("cuda", enabled=dev.type == "cuda")
+    n_par = sum(p.numel() for p in model.parameters())
+    print(f"\n=== {EXPERIMENTS[exp_key]['name']} | seed {seed} | params {n_par/1e6:.2f}M ===")
+
+    best, bad, hist, best_state, ep_times = -1.0, 0, [], None, []
+    for ep in range(1, args.epochs + 1):
+        t1 = time.time()
+        tr = run_epoch(model, data, idx["train"], args, opt, sched, scaler, ema)
+        va = run_epoch(ema.module, data, idx["val"], args)
+        auc = float(roc_auc_score(yv, va["p"])); auc_e = float(roc_auc_score(yv, va["early"][:, -1]))
+        ep_times.append(time.time() - t1)
+        hist.append(dict(epoch=ep, train_loss=tr["loss"], val_loss=va["loss"], val_auc=auc, val_auc_graph=auc_e))
+        star = ""
+        if auc > best:
+            best, bad, star = auc, 0, " *"
+            best_state = {k: v.detach().cpu().clone() for k, v in ema.module.state_dict().items()}
+        else:
+            bad += 1
+        print(f"  ep {ep:02d} | tr {tr['loss']:.4f} | va {va['loss']:.4f} | AUC {auc:.4f} | "
+              f"graph-head AUC {auc_e:.4f} | {time.time()-t1:.0f}s{star}")
+        if bad >= args.patience:
+            print("  [early stop]"); break
+
+    ema.module.load_state_dict(best_state)
+    m = ema.module
+    va = run_epoch(m, data, idx["val"], args)
+    t2 = time.time()
+    te = run_epoch(m, data, idx["test"], args, keep_attn=keep_attn and not args.no_graph)
+    infer = time.time() - t2
+    res = dict(val_p=va["p"], val_early=va["early"], test_p=te["p"], test_early=te["early"],
+               history=np.array(json.dumps(hist)), n_params=np.array(n_par),
+               epoch_sec=np.array(np.mean(ep_times)), infer_ms_per_1k=np.array(1000 * infer / len(idx["test"]) * 1000),
+               best_epoch=np.array(int(np.argmax([h["val_auc"] for h in hist])) + 1))
+    for k in ["z", "type_att", "evt_att"]:
+        if k in te:
+            res[k] = te[k]
+    np.savez(path, **res)
+    if exp_key in KEEP_STATE:
+        torch.save(best_state, os.path.join(run_dir, f"{exp_key}_s{seed}_model.pt"))
+    del model, ema, opt, m
+    gc.collect()
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
+    return {k: (v if not isinstance(v, np.ndarray) else v) for k, v in res.items()}
+
+
+# ==================================================================================
+# 4. Baselines (LightGBM)
+# ==================================================================================
+def lgb_fit_predict(Xtr, ytr, Xva, yva, Xte, seed, threads, cat=None):
+    import lightgbm as lgb
+    m = lgb.LGBMClassifier(n_estimators=4000, learning_rate=0.03, num_leaves=63, min_child_samples=40,
+                           subsample=0.8, subsample_freq=1, colsample_bytree=0.5, reg_lambda=1.0,
+                           random_state=seed, n_jobs=threads or -1, verbose=-1)
+    m.fit(Xtr, ytr, eval_set=[(Xva, yva)], eval_metric="auc",
+          callbacks=[lgb.early_stopping(150, verbose=False)],
+          categorical_feature=cat if cat is not None else "auto")
+    return m.predict_proba(Xva)[:, 1], m.predict_proba(Xte)[:, 1], m.best_iteration_
+
+
+def run_lgb_full(T, sp, seed, args, run_dir):
+    path = os.path.join(run_dir, f"lgb_full_s{seed}.npz")
+    if os.path.exists(path):
+        z = np.load(path); return dict(val_p=z["val_p"], test_p=z["test_p"])
+    X = pd.DataFrame(T["static"]); X.columns = [f"f{i}" for i in range(X.shape[1])]
+    X["course"] = pd.Categorical(T["course"])
+    y = T["y"]
+    t1 = time.time()
+    vp, tp, it = lgb_fit_predict(X[sp == 0], y[sp == 0], X[sp == 1], y[sp == 1], X[sp == 2], seed,
+                                 args.lgb_threads, cat=["course"])
+    print(f"  LightGBM seed {seed}: val AUC {roc_auc_score(y[sp==1], vp):.4f} | iters {it} | {time.time()-t1:.0f}s")
+    np.savez(path, val_p=vp, test_p=tp)
+    return dict(val_p=vp, test_p=tp)
+
+
+def causal_features(T, s, snap_every):
+    D = (s + 1) * snap_every
+    day = T["day"][:, :D]
+    parts = [day.reshape(len(day), -1), day.mean(1), day[:, max(0, D - 5):D].mean(1),
+             day[:, max(0, D - 5):D].max(1), T["evw"][:, :s + 1].reshape(len(day), -1), T["userf"]]
+    X = pd.DataFrame(np.concatenate(parts, 1).astype(np.float32))
+    X.columns = [f"f{i}" for i in range(X.shape[1])]
+    X["course"] = pd.Categorical(T["course"])
+    return X
+
+
+def run_causal_lgb(T, info, sp, args, run_dir):
+    path = os.path.join(run_dir, "lgb_causal.npz")
+    if os.path.exists(path):
+        z = np.load(path); return dict(val_early=z["val_early"], test_early=z["test_early"])
+    y = T["y"]; S = info["S"]
+    VE = np.zeros(((sp == 1).sum(), S)); TE = np.zeros(((sp == 2).sum(), S))
+    for s in range(S):
+        t1 = time.time()
+        X = causal_features(T, s, info["snap_every"])
+        vp, tp, it = lgb_fit_predict(X[sp == 0], y[sp == 0], X[sp == 1], y[sp == 1], X[sp == 2], 0,
+                                     args.lgb_threads, cat=["course"])
+        VE[:, s], TE[:, s] = vp, tp
+        print(f"  Causal-LightGBM day {info['snap_days'][s]:2d}: val AUC {roc_auc_score(y[sp==1], vp):.4f} "
+              f"| feats {X.shape[1]} | {time.time()-t1:.0f}s")
+        del X; gc.collect()
+    np.savez(path, val_early=VE, test_early=TE)
+    return dict(val_early=VE, test_early=TE)
+
+
+# ==================================================================================
+# 5. Statistics
+# ==================================================================================
+def ece_score(y, p, bins=15):
+    edges = np.linspace(0, 1, bins + 1); e = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (p > lo) & (p <= hi)
+        if m.any():
+            e += m.mean() * abs(y[m].mean() - p[m].mean())
+    return float(e)
+
+
+def best_threshold(y, p):
+    g = np.linspace(0.05, 0.95, 91)
+    return float(g[int(np.argmax([f1_score(y, (p >= t).astype(int), average="macro") for t in g]))])
+
+
+def metrics(y, p, thr=0.5):
+    p = np.clip(np.asarray(p, np.float64), 1e-7, 1 - 1e-7)
+    yh = (p >= thr).astype(int)
+    return dict(auc=float(roc_auc_score(y, p)), pr_auc=float(average_precision_score(y, p)),
+                logloss=float(log_loss(y, p)), brier=float(brier_score_loss(y, p)), ece=ece_score(y, p),
+                acc=float(accuracy_score(y, yh)), f1=float(f1_score(y, yh)),
+                macro_f1=float(f1_score(y, yh, average="macro")),
+                precision=float(precision_score(y, yh)), recall=float(recall_score(y, yh)), threshold=float(thr))
+
+
+def bootstrap_ci(y, p, n=1000, seed=0):
+    rng = np.random.RandomState(seed); N = len(y); a = []
+    for _ in range(n):
+        i = rng.randint(0, N, N)
+        if y[i].min() != y[i].max():
+            a.append(roc_auc_score(y[i], p[i]))
+    return float(np.percentile(a, 2.5)), float(np.percentile(a, 97.5))
+
+
+def delong_test(y, p1, p2):
+    """DeLong et al. (1988) test for two correlated ROC AUCs (Sun & Xu 2014 formulation)."""
+    y = np.asarray(y).astype(bool); m, n = y.sum(), (~y).sum()
+    V10, V01, aucs = [], [], []
+    for p in (p1, p2):
+        px, py = p[y], p[~y]
+        tx, ty, tz = rankdata(px), rankdata(py), rankdata(np.r_[px, py])
+        aucs.append((tz[:m].sum() - m * (m + 1) / 2) / (m * n))
+        V10.append((tz[:m] - tx) / n)
+        V01.append(1.0 - (tz[m:] - ty) / m)
+    S = np.cov(np.array(V10)) / m + np.cov(np.array(V01)) / n
+    var = S[0, 0] + S[1, 1] - 2 * S[0, 1]
+    z = (aucs[0] - aucs[1]) / np.sqrt(max(var, 1e-18))
+    return float(aucs[0]), float(aucs[1]), float(z), float(2 * norm.sf(abs(z)))
+
+
+def logit(p):
+    p = np.clip(p, 1e-6, 1 - 1e-6); return np.log(p / (1 - p))
+
+
+def blend(pa, pb, w):
+    return 1 / (1 + np.exp(-(w * logit(pa) + (1 - w) * logit(pb))))
+
+
+def tune_blend(yv, va, vb):
+    ws = np.linspace(0, 1, 21)
+    sc = [roc_auc_score(yv, blend(va, vb, w)) for w in ws]
+    return float(ws[int(np.argmax(sc))])
+
+
+def fmt(mu, sd=None, d=4):
+    return f"{mu:.{d}f}" if sd is None or np.isnan(sd) else f"{mu:.{d}f} ± {sd:.{d}f}"
+
+
+def df_to_md(df):
+    cols = [str(c) for c in df.columns]
+    lines = ["| " + " | ".join([df.index.name or ""] + cols) + " |",
+             "|" + "---|" * (len(cols) + 1)]
+    for i, r in df.iterrows():
+        lines.append("| " + " | ".join([str(i)] + [str(v) for v in r.values]) + " |")
+    return "\n".join(lines)
+
+
+# ==================================================================================
+# 6. Post-hoc analyses (calibration, multiple testing, subgroups, occlusion)
+# ==================================================================================
+def fit_temperature(yv, pv):
+    from scipy.optimize import minimize_scalar
+    z = logit(pv)
+    f = lambda t: log_loss(yv, 1 / (1 + np.exp(-z / t)), labels=[0, 1])
+    return float(minimize_scalar(f, bounds=(0.05, 10.0), method="bounded").x)
+
+
+def apply_temperature(p, t):
+    return 1 / (1 + np.exp(-logit(p) / t))
+
+
+def holm(pvals):
+    p = np.asarray(pvals, float); m = len(p)
+    order = np.argsort(p); adj = np.empty(m); run = 0.0
+    for r, i in enumerate(order):
+        run = max(run, (m - r) * p[i]); adj[i] = min(1.0, run)
+    return adj
+
+
+def paired_boot_delta(y, pa, pb, n=1000, seed=0):
+    rng = np.random.RandomState(seed); N = len(y); d = []
+    for _ in range(n):
+        i = rng.randint(0, N, N)
+        if y[i].min() != y[i].max():
+            d.append(roc_auc_score(y[i], pa[i]) - roc_auc_score(y[i], pb[i]))
+    return float(np.percentile(d, 2.5)), float(np.percentile(d, 97.5))
+
+
+def occlusion_analysis(exp_key, seeds, info, data, idx, yt, base_args, run_dir):
+    path = os.path.join(run_dir, f"occlusion_{exp_key}.csv")
+    if os.path.exists(path):
+        return pd.read_csv(path)
+    targets = ["user", "course", "event_type", "object", "sibling"] + [f"evt:{k}" for k in range(7)]
+    rows = []
+    for s in seeds:
+        ck = os.path.join(run_dir, f"{exp_key}_s{s}_model.pt")
+        if not os.path.exists(ck):
+            continue
+        a = copy.copy(base_args)
+        for k, v in EXPERIMENTS[exp_key]["flags"].items():
+            setattr(a, k, v)
+        model = THGTv2(info, a).to(data.dev)
+        model.load_state_dict(torch.load(ck, map_location=data.dev))
+        base = roc_auc_score(yt, run_epoch(model, data, idx["test"], a)["p"])
+        for tg in targets:
+            auc = roc_auc_score(yt, run_epoch(model, data, idx["test"], a, occl=(tg,))["p"])
+            name = f"event:{ACTS[int(tg[4:])]}" if tg.startswith("evt:") else tg
+            rows.append(dict(seed=s, occluded=name, auc=auc, delta_auc=auc - base))
+        print(f"  occlusion {exp_key} seed {s} done (base AUC {base:.4f})")
+        del model
+    df = pd.DataFrame(rows)
+    df.to_csv(path, index=False)
+    return df
+
+
+# ==================================================================================
+# Figure export (vector PDF for the journal; PNG optional for previews)
+# ==================================================================================
+FIG_FORMATS = ("pdf",)
+
+
+def set_pub_style():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({
+        "pdf.fonttype": 42, "ps.fonttype": 42,          # embed TrueType fonts (journal requirement)
+        "font.family": "DejaVu Sans", "font.size": 9,
+        "axes.titlesize": 10, "axes.labelsize": 9, "legend.fontsize": 7.5,
+        "xtick.labelsize": 8, "ytick.labelsize": 8,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "savefig.bbox": "tight", "savefig.pad_inches": 0.03,
+        "figure.dpi": 100})
+    return plt
+
+
+def save_figure(fig, path_noext, formats=None):
+    """Save a matplotlib figure in every requested format; PDF is vector with embedded fonts."""
+    import matplotlib.pyplot as plt
+    formats = formats or FIG_FORMATS
+    written = []
+    for fmt in formats:
+        fmt = fmt.strip().lower().lstrip(".")
+        if not fmt:
+            continue
+        path = f"{path_noext}.{fmt}"
+        kw = dict(bbox_inches="tight")
+        if fmt == "pdf":
+            kw["metadata"] = {"Creator": "THGT v5", "Title": os.path.basename(path_noext)}
+        else:
+            kw["dpi"] = 300
+        fig.savefig(path, format=fmt, **kw)
+        written.append(path)
+    plt.close(fig)
+    print("   [figure] " + ", ".join(os.path.basename(w) for w in written))
+    return written
+
+
+def draw_architecture(path_noext):
+    """Publication figure of the THGT architecture (vector PDF; other formats via --fig_formats)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"pdf.fonttype": 42, "ps.fonttype": 42})
+    from matplotlib.patches import FancyBboxPatch, Circle, Rectangle
+
+    col = dict(enr="#C0392B", user="#8E44AD", course="#2471A3", evt="#D68910", obj="#239B56", sib="#7F8C8D")
+    fig, ax = plt.subplots(figsize=(19, 8.2))
+    ax.set_xlim(0, 19); ax.set_ylim(0, 8.2); ax.axis("off")
+
+    def box(x, y, w, h, title, lines=(), fc="#F4F6F7", ec="#34495E", tsize=11.5):
+        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.15",
+                                    fc=fc, ec=ec, lw=1.6))
+        ax.text(x + w / 2, y + h - 0.28, title, ha="center", va="top", fontsize=tsize, weight="bold")
+        for i, l in enumerate(lines):
+            ax.text(x + w / 2, y + h - 0.78 - i * 0.36, l, ha="center", va="top", fontsize=9.2)
+
+    def arrow(x1, y1, x2, y2, txt=None, c="#34495E", ls="-"):
+        ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
+                    arrowprops=dict(arrowstyle="-|>", color=c, lw=1.8, ls=ls, mutation_scale=16))
+        if txt:
+            ax.text((x1 + x2) / 2, (y1 + y2) / 2 + 0.16, txt, ha="center", fontsize=9, style="italic")
+
+    for x, lab in [(0.25, "(a) Input"), (3.05, "(b) Temporal encoder"), (5.9, "(c) Snapshot heterogeneous ego-graph"),
+                   (10.85, "(d) Graph encoder"), (13.55, "(e) Evolution encoder"), (16.55, "(f) Prediction")]:
+        ax.text(x, 7.95, lab, fontsize=12.5, weight="bold", color="#1B2631", va="top")
+
+    # (a)
+    box(0.2, 5.35, 2.55, 2.1, "Raw clickstream", ["enrollment, time,", "source, event, object", "8.16M events"], fc="#FDEBD0")
+    box(0.2, 2.75, 2.55, 2.15, "Daily behaviour", [r"$X_i\in\mathbb{R}^{30\times17}$", "7 event counts, sessions,", "time, objects, releases"], fc="#FDEBD0")
+    box(0.2, 0.25, 2.55, 1.85, "Tabular features", [r"$x_i^{tab}\in\mathbb{R}^{439}$", "(optional, full-period)"], fc="#EAEDED", ec="#7F8C8D")
+    arrow(1.47, 5.35, 1.47, 4.9)
+
+    # (b)
+    box(3.05, 2.75, 2.45, 2.15, "Causal day-level", ["Transformer", r"(masked self-attention)", r"$h_{i,t},\ t=1..30$"], fc="#D6EAF8")
+    arrow(2.75, 3.82, 3.05, 3.82)
+    ax.text(4.27, 2.45, "shared for target and\nsibling enrollments", ha="center", fontsize=8.5, color="#555")
+
+    # (c) ego-graph
+    ax.add_patch(FancyBboxPatch((5.85, 0.9), 4.6, 6.6, boxstyle="round,pad=0.02,rounding_size=0.2",
+                                fc="#FBFCFC", ec="#34495E", lw=1.4, ls="--"))
+    ax.text(8.15, 7.25, r"$\mathcal{G}_i^{(s)}$ at day $d_s\in\{5,10,\dots,30\}$", ha="center", fontsize=11)
+    E = (8.15, 4.3); U = (6.65, 6.2); C = (9.65, 6.2)
+    ev = [(6.55 + k * 0.55, 1.85) for k in range(7)]
+    ob = [(6.7 + k * 0.62, 3.05) for k in range(6)]
+    sb = [(6.25, 5.05), (6.55, 4.55)]
+    for (x, y) in ev:
+        ax.plot([E[0], x], [E[1], y], color=col["evt"], lw=1.0, alpha=.7)
+    for (x, y) in ob:
+        ax.plot([E[0], x], [E[1], y], color=col["obj"], lw=1.0, alpha=.7)
+        ax.plot([x, ev[min(6, int((x - 6.7) / 0.62))][0]], [y, ev[min(6, int((x - 6.7) / 0.62))][1]],
+                color="#AAB7B8", lw=0.7, ls=":")
+    for P in (U, C):
+        ax.plot([E[0], P[0]], [E[1], P[1]], color="#34495E", lw=1.4)
+    for (x, y) in sb:
+        ax.plot([U[0], x], [U[1], y], color=col["sib"], lw=1.1)
+    ax.plot([C[0], 10.1], [C[1], 3.2], color="#AAB7B8", lw=0.8, ls=":")
+    for (x, y) in ev:
+        ax.add_patch(Circle((x, y), 0.19, fc=col["evt"], ec="k", lw=.6))
+    for (x, y) in ob:
+        ax.add_patch(Rectangle((x - .16, y - .16), .32, .32, fc=col["obj"], ec="k", lw=.6))
+    for (x, y) in sb:
+        ax.add_patch(Circle((x, y), 0.2, fc=col["sib"], ec="k", lw=.6))
+    ax.add_patch(Circle(E, 0.42, fc=col["enr"], ec="k", lw=1.2)); ax.text(*E, "E", ha="center", va="center", color="w", weight="bold", fontsize=13)
+    ax.add_patch(Circle(U, 0.34, fc=col["user"], ec="k")); ax.text(*U, "U", ha="center", va="center", color="w", weight="bold")
+    ax.add_patch(Circle(C, 0.34, fc=col["course"], ec="k")); ax.text(*C, "C", ha="center", va="center", color="w", weight="bold")
+    ax.text(8.15, 1.35, "7 event-type nodes (window counts)", ha="center", fontsize=8.5, color=col["evt"])
+    ax.text(8.5, 2.55, "top-M learning objects (count, age, popularity)", ha="center", fontsize=8.5, color=col["obj"])
+    ax.text(6.2, 5.55, "sibling\nenrollments", ha="center", fontsize=8, color=col["sib"])
+    ax.text(C[0], C[1] + 0.5, "course\n(release, cohort activity)", ha="center", fontsize=8, color=col["course"])
+    ax.text(U[0], U[1] + 0.45, "user", ha="center", fontsize=8, color=col["user"])
+    ax.text(E[0] + 0.55, E[1] + 0.25, r"$h_{i,d_s}$", fontsize=10)
+    arrow(5.5, 3.95, 7.72, 4.3, c=col["enr"])
+
+    # (d)
+    box(10.85, 2.55, 2.4, 3.6, r"HGT layer $\times L$",
+        ["type-specific", r"$Q_{\tau},K_{\tau},V_{\tau},O_{\tau}$", r"relation prior $\mu_{\phi}$,", r"bias $b_{\phi}$",
+         r"edge bias $\omega\log(1{+}c)$", "adjacency mask"], fc="#E8DAEF")
+    arrow(10.45, 4.3, 10.85, 4.3)
+    ax.text(12.05, 2.05, r"$z_i^{(s)}=\mathrm{readout}(E)$", ha="center", fontsize=10.5)
+
+    # (e)
+    box(13.55, 2.55, 2.65, 3.6, "Causal snapshot\nTransformer", [], fc="#D5F5E3")
+    for k in range(6):
+        x = 13.8 + k * 0.4
+        ax.add_patch(Rectangle((x, 3.05), 0.3, 0.55, fc=col["enr"], ec="k", lw=.6, alpha=.35 + .1 * k))
+        ax.text(x + .15, 2.85, f"$z^{{({k+1})}}$", ha="center", fontsize=7.5)
+        ax.annotate("", xy=(x + .15, 4.6), xytext=(x + .15, 3.62),
+                    arrowprops=dict(arrowstyle="-|>", lw=.8, color="#1E8449"))
+        ax.text(x + .15, 4.68, f"$\\hat y^{{({k+1})}}$", ha="center", fontsize=7.8)
+    ax.text(14.88, 2.05, "early-warning heads\n(use only days $\\leq d_s$)", ha="center", fontsize=8.5, color="#1E8449")
+    arrow(13.25, 4.3, 13.55, 4.3)
+    ax.text(12.3, 6.65, r"repeated for $s=1,\dots,6$ (shared weights)", fontsize=9, style="italic", ha="center")
+
+    # (f)
+    box(16.55, 3.0, 2.25, 2.6, "Fusion MLP", [r"$[\,\tilde z^{(S)},\ \overline{\tilde z},\ g(x^{tab})\,]$",
+                                              r"$\hat y_i=\sigma(\cdot)$", "dropout risk"], fc="#FADBD8")
+    arrow(16.2, 4.3, 16.55, 4.3)
+    ax.annotate("", xy=(17.67, 3.0), xytext=(2.75, 0.6),
+                arrowprops=dict(arrowstyle="-|>", color="#7F8C8D", lw=1.5, ls="--",
+                                connectionstyle="angle,angleA=0,angleB=90,rad=0"))
+    ax.text(10.2, 0.25, r"MLP $g(\cdot)$ — removed in THGT-Causal", fontsize=9, color="#7F8C8D", ha="center")
+    box(16.55, 6.05, 2.25, 1.3, "Loss", [r"$\mathcal{L}=\mathrm{BCE}(\hat y)+\lambda\,\overline{\mathrm{BCE}}(\hat y^{(s)})$"],
+        fc="#FEF9E7", tsize=10.5)
+
+    leg = [("enrollment", col["enr"]), ("user", col["user"]), ("course", col["course"]),
+           ("event type", col["evt"]), ("object", col["obj"]), ("sibling", col["sib"])]
+    for k, (n, c) in enumerate(leg):
+        if n == "object":
+            ax.add_patch(Rectangle((11.0 + k * 1.05 - .09, 1.2 - .09), .18, .18, fc=c, ec="k", lw=.5))
+        else:
+            ax.add_patch(Circle((11.0 + k * 1.05, 1.2), 0.1, fc=c, ec="k", lw=.5))
+        ax.text(11.15 + k * 1.05, 1.2, n, va="center", fontsize=8.3)
+    fig.tight_layout()
+    save_figure(fig, path_noext)
+
+
+def to_latex(df, path, caption, label):
+    try:
+        t = df.copy().astype(str).apply(lambda c: c.str.replace("±", r"$\pm$", regex=False))
+        with open(path, "w") as f:
+            f.write(t.to_latex(escape=False, caption=caption, label=label))
+    except Exception as ex:
+        print("[latex] skipped", path, ex)
+
+
+# ==================================================================================
+# 7. Main pipeline
+# ==================================================================================
+def main():
+    args = get_args()
+    kaggle = os.path.exists("/kaggle/working")
+    global FIG_FORMATS
+    FIG_FORMATS = tuple(f.strip() for f in args.fig_formats.split(",") if f.strip()) or ("pdf",)
+    # separate output folder per sibling alignment, so cached v4 runs are never reused by v5
+    out = args.out or (f"/kaggle/working/thgt_v5_{args.sib_align}_outputs" if kaggle
+                       else f"./thgt_v5_{args.sib_align}_outputs")
+    run_dir = os.path.join(out, "runs"); fig_dir = os.path.join(out, "figures"); tab_dir = os.path.join(out, "tables")
+    for dd in (out, run_dir, fig_dir, tab_dir):
+        os.makedirs(dd, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seeds = [int(s) for s in args.seeds.split(",") if s != ""]
+    exps = [e for e in args.exps.split(",") if e in EXPERIMENTS]
+    if args.debug:
+        seeds = seeds[:2]
+    print(f"[device] {device} | out {out} | exps {exps} | seeds {seeds}")
+    T0 = time.time()
+    try:
+        draw_architecture(os.path.join(fig_dir, "architecture"))
+    except Exception as ex:
+        print("[architecture] skipped:", ex)
+
+    # ---------------- data / graph ----------------
+    merged_path = find_file(args.merged, ["/kaggle/input/**/merged_AB_processed*", "./merged_AB_processed*",
+                                          "/mnt/user-data/uploads/merged_AB_processed*"])
+    log_path = find_file(args.log, ["/kaggle/input/**/log_train.csv", "/kaggle/input/**/log_train.zip",
+                                    "/kaggle/input/**/log_train*", "./log_train*", "/mnt/user-data/uploads/log_train*"])
+    tag = f"se{args.snap_every}_m{args.max_obj}_k{args.max_sib}_n{args.max_enroll}_{args.sib_align}"
+    cache = os.path.join(out, f"graph_cache_{tag}.npz")
+    if os.path.exists(cache):
+        z = np.load(cache, allow_pickle=True)
+        T = {k: z[k] for k in z.files if k != "info"}; info = z["info"].item()
+    else:
+        meta = pd.read_csv(merged_path, low_memory=False)
+        fc = meta.select_dtypes(include=[np.floating]).columns
+        meta[fc] = meta[fc].astype(np.float32)
+        if args.max_enroll and args.max_enroll < len(meta):
+            users = meta["user"].unique(); rng = np.random.RandomState(0); rng.shuffle(users)
+            cs = meta.groupby("user").size().loc[users].cumsum()
+            meta = meta[meta["user"].isin(set(cs[cs <= args.max_enroll].index))]
+        meta = meta.reset_index(drop=True)
+        logs = read_logs(log_path, set(meta["enrollment_id"]) if args.max_enroll else None)
+        T, info = build_graph(logs, meta, args)
+        del logs, meta; gc.collect()
+        np.savez(cache, info=np.array(info, dtype=object), **T)
+    print(f"[graph] {info} ({time.time()-T0:.0f}s)")
+
+    sp, y = T["split"], T["y"]
+    yv, yt = y[sp == 1], y[sp == 2]
+    te_rows = np.where(sp == 2)[0]
+    idx = {s: torch.tensor(np.where(sp == i)[0], device=device) for i, s in enumerate(["train", "val", "test"])}
+    print({k: len(v) for k, v in idx.items()}, "| dropout rate:", round(float(y.mean()), 4))
+    data = GPUData(T, info, device)
+
+    # dataset statistics (for the paper)
+    ds_stats = dict(n_enrollments=int(len(y)), n_users=None, n_courses=int(info["n_course"]),
+                    n_objects=int(info["n_obj"]), n_object_vocab=int(info["n_vocab"]),
+                    dropout_rate=float(y.mean()), multi_course_share=float((T["sib"][:, 0] >= 0).mean()),
+                    split_sizes={k: int(len(v)) for k, v in idx.items()})
+
+    # ---------------- THGT experiments ----------------
+    R = {e: [] for e in exps}
+    for e in exps:
+        for s in seeds:
+            R[e].append(train_run(e, s, info, data, idx, yv, args, run_dir, keep_attn=(e in ("full", "causal"))))
+            print(f"  elapsed {(time.time()-T0)/60:.1f} min")
+
+    # ---------------- occlusion (needs GPU data) ----------------
+    OCC = {}
+    if not args.skip_occlusion:
+        for e in [x for x in ("causal", "full") if x in exps]:
+            print(f"\n=== Occlusion analysis: {EXPERIMENTS[e]['name']} ===")
+            OCC[e] = occlusion_analysis(e, seeds, info, data, idx, yt, args, run_dir)
+    del data; gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # ---------------- baselines ----------------
+    LG, LC = [], None
+    if not args.skip_lgb:
+        print("\n=== LightGBM (full-period tabular features) ===")
+        LG = [run_lgb_full(T, sp, s, args, run_dir) for s in seeds]
+    if not args.skip_causal_lgb:
+        print("\n=== Causal LightGBM (logs up to day d) ===")
+        LC = run_causal_lgb(T, info, sp, args, run_dir)
+
+    # ---------------- model registry ----------------
+    LGB_NAME = "LightGBM (439 engineered feats)"
+    runs = {EXPERIMENTS[e]["name"]: R[e] for e in exps}
+    if LG:
+        runs[LGB_NAME] = LG
+    ENS_NAME = None
+    if LG and "full" in exps:
+        vT = np.mean([r["val_p"] for r in R["full"]], 0); vL = np.mean([r["val_p"] for r in LG], 0)
+        w = tune_blend(yv, vT, vL)
+        ENS_NAME = f"Ensemble THGT-Full + LightGBM (w={w:.2f})"
+        runs[ENS_NAME] = [dict(val_p=blend(a["val_p"], b["val_p"], w), test_p=blend(a["test_p"], b["test_p"], w))
+                          for a, b in zip(R["full"], LG)]
+
+    # temperature scaling per run (fit on validation only)
+    for name, rr in runs.items():
+        for r in rr:
+            t = fit_temperature(yv, r["val_p"])
+            r["T"] = t
+            r["val_p_ts"] = apply_temperature(r["val_p"], t)
+            r["test_p_ts"] = apply_temperature(r["test_p"], t)
+    avg = {n: (np.mean([r["val_p"] for r in rr], 0), np.mean([r["test_p"] for r in rr], 0)) for n, rr in runs.items()}
+    avg_ts = {n: (np.mean([r["val_p_ts"] for r in rr], 0), np.mean([r["test_p_ts"] for r in rr], 0)) for n, rr in runs.items()}
+
+    # ---------------- Table 1: main results ----------------
+    rows = {}
+    for name, rr in runs.items():
+        per = [metrics(yt, r["test_p_ts"], best_threshold(yv, r["val_p_ts"])) for r in rr]
+        va_, ta_ = avg_ts[name]
+        lo, hi = bootstrap_ci(yt, ta_, args.n_boot)
+        row = {}
+        for k in ["auc", "pr_auc", "macro_f1", "f1", "logloss", "brier", "ece"]:
+            v = [m[k] for m in per]
+            row[k.upper()] = fmt(np.mean(v), np.std(v) if len(v) > 1 else None)
+        row["AUC seed-avg [95% CI]"] = f"{roc_auc_score(yt, ta_):.4f} [{lo:.4f}, {hi:.4f}]"
+        rows[name] = row
+    main_df = pd.DataFrame(rows).T; main_df.index.name = "Model"
+    main_df.to_csv(os.path.join(tab_dir, "table1_main.csv"))
+    to_latex(main_df, os.path.join(tab_dir, "table1_main.tex"),
+             "Test performance (temperature-scaled; mean $\\pm$ std over seeds).", "tab:main")
+
+    # ---------------- Table 2: calibration before/after TS ----------------
+    cal = []
+    for name, rr in runs.items():
+        for tag_, key in [("raw", "test_p"), ("TS", "test_p_ts")]:
+            e_ = [ece_score(yt, r[key]) for r in rr]; b_ = [brier_score_loss(yt, r[key]) for r in rr]
+            l_ = [log_loss(yt, np.clip(r[key], 1e-7, 1 - 1e-7)) for r in rr]
+            cal.append(dict(model=name, calibration=tag_, T=fmt(np.mean([r["T"] for r in rr]), None, 3) if tag_ == "TS" else "1",
+                            ECE=fmt(np.mean(e_), np.std(e_)), Brier=fmt(np.mean(b_), np.std(b_)),
+                            LogLoss=fmt(np.mean(l_), np.std(l_))))
+    cal_df = pd.DataFrame(cal)
+    cal_df.to_csv(os.path.join(tab_dir, "table2_calibration.csv"), index=False)
+    to_latex(cal_df.set_index("model"), os.path.join(tab_dir, "table2_calibration.tex"),
+             "Calibration before and after temperature scaling.", "tab:calib")
+
+    # ---------------- Table 3: ablation ----------------
+    abl = []
+    if "causal" in exps:
+        ref_runs = R["causal"]; ref_avg = avg["THGT-Causal"][1]
+        ref = [roc_auc_score(yt, r["test_p"]) for r in ref_runs]
+        for e in ["causal", "no_graph", "no_hetero", "no_objects", "no_siblings"]:
+            if e not in exps:
+                continue
+            a = [roc_auc_score(yt, r["test_p"]) for r in R[e]]
+            row = dict(variant=EXPERIMENTS[e]["name"], AUC=fmt(np.mean(a), np.std(a)),
+                       PR_AUC=fmt(np.mean([average_precision_score(yt, r["test_p"]) for r in R[e]]),
+                                  np.std([average_precision_score(yt, r["test_p"]) for r in R[e]])),
+                       delta=np.mean(a) - np.mean(ref))
+            if e != "causal":
+                pa = avg[EXPERIMENTS[e]["name"]][1]
+                lo, hi = paired_boot_delta(yt, pa, ref_avg, args.n_boot)
+                _, _, zz, pv = delong_test(yt, pa, ref_avg)   # sign: variant − reference
+                row.update(delta_CI=f"[{lo:+.4f}, {hi:+.4f}]", z=zz, p=pv)
+            abl.append(row)
+    abl_df = pd.DataFrame(abl)
+    if len(abl_df) and "p" in abl_df:
+        m_ = abl_df["p"].notna()
+        abl_df.loc[m_, "p_holm"] = holm(abl_df.loc[m_, "p"].values)
+    abl_df.to_csv(os.path.join(tab_dir, "table3_ablation.csv"), index=False)
+    to_latex(abl_df.set_index("variant").round(5), os.path.join(tab_dir, "table3_ablation.tex"),
+             "Ablation study relative to THGT-Causal (DeLong test, Holm-adjusted).", "tab:ablation")
+
+    # ---------------- Table 4: significance (main family, Holm) ----------------
+    sig = []
+
+    def cmp(a, b):
+        if a in avg and b in avg:
+            a1, a2, zz, pv = delong_test(yt, avg[a][1], avg[b][1])
+            lo, hi = paired_boot_delta(yt, avg[a][1], avg[b][1], args.n_boot)
+            sig.append(dict(model_A=a, model_B=b, auc_A=a1, auc_B=a2, delta=a1 - a2,
+                            delta_CI=f"[{lo:+.4f}, {hi:+.4f}]", z=zz, p=pv))
+    cmp("THGT-Full", LGB_NAME); cmp("THGT-Causal", LGB_NAME)
+    if ENS_NAME:
+        cmp(ENS_NAME, LGB_NAME); cmp(ENS_NAME, "THGT-Full")
+    cmp("THGT-Full", "THGT-Causal")
+    sig_df = pd.DataFrame(sig)
+    if len(sig_df):
+        sig_df["p_holm"] = holm(sig_df["p"].values)
+        sig_df["significant (Holm, 0.05)"] = sig_df["p_holm"] < 0.05
+    sig_df.to_csv(os.path.join(tab_dir, "table4_significance.csv"), index=False)
+
+    # ---------------- Table 5: early warning (Holm) ----------------
+    days = info["snap_days"]
+    ew_rows, ew_curves = [], {}
+    ew_src = "causal" if "causal" in exps else ("full" if "full" in exps else None)
+    for s, dd in enumerate(days):
+        row = {"day": dd}
+        for e in [x for x in ["causal", "full", "no_graph"] if x in exps]:
+            a = [roc_auc_score(yt, r["test_early"][:, s]) for r in R[e]]
+            row[EXPERIMENTS[e]["name"]] = fmt(np.mean(a), np.std(a) if len(a) > 1 else None)
+            ew_curves.setdefault(EXPERIMENTS[e]["name"], []).append((np.mean(a), np.std(a)))
+        if LC is not None:
+            a = roc_auc_score(yt, LC["test_early"][:, s])
+            row["Causal-LightGBM"] = fmt(a)
+            ew_curves.setdefault("Causal-LightGBM", []).append((a, 0.0))
+            if ew_src:
+                vT = np.mean([r["val_early"][:, s] for r in R[ew_src]], 0)
+                tT = np.mean([r["test_early"][:, s] for r in R[ew_src]], 0)
+                w = tune_blend(yv, vT, LC["val_early"][:, s])
+                eb = blend(tT, LC["test_early"][:, s], w)
+                row["Causal ensemble"] = fmt(roc_auc_score(yt, eb))
+                ew_curves.setdefault("Causal ensemble", []).append((roc_auc_score(yt, eb), 0.0))
+                _, _, zz, pv = delong_test(yt, tT, LC["test_early"][:, s])
+                lo, hi = paired_boot_delta(yt, tT, LC["test_early"][:, s], args.n_boot)
+                row["Δ THGT−LGB [95% CI]"] = f"{roc_auc_score(yt, tT) - a:+.4f} [{lo:+.4f}, {hi:+.4f}]"
+                row["p"] = pv
+        ew_rows.append(row)
+    ew_df = pd.DataFrame(ew_rows).set_index("day")
+    if "p" in ew_df:
+        ew_df["p_holm"] = holm(ew_df["p"].values)
+    ew_df.to_csv(os.path.join(tab_dir, "table5_early_warning.csv"))
+    to_latex(ew_df, os.path.join(tab_dir, "table5_early_warning.tex"),
+             "Early-warning AUC using only data up to day $d$.", "tab:early")
+
+    # ---------------- Table 6: subgroup analysis ----------------
+    sub_rows = []
+    multi = T["sib"][te_rows, 0] >= 0
+    act = np.expm1(T["evw"][te_rows, :, :, 0]).sum((1, 2))
+    q1, q2 = np.quantile(act, [1 / 3, 2 / 3])
+    groups = {"all": np.ones(len(yt), bool), "multi-course learners": multi, "single-course learners": ~multi,
+              "activity: low tertile": act <= q1, "activity: mid tertile": (act > q1) & (act <= q2),
+              "activity: high tertile": act > q2}
+    sub_models = [n for n in ["THGT-Full", "THGT-Causal", "w/o Sibling enrollments", "w/o Graph (Temporal only)",
+                              LGB_NAME, ENS_NAME] if n in avg]
+    for g, m_ in groups.items():
+        if m_.sum() < 50 or yt[m_].min() == yt[m_].max():
+            continue
+        row = dict(subgroup=g, n=int(m_.sum()), dropout_rate=round(float(yt[m_].mean()), 3))
+        for n in sub_models:
+            row[n] = round(float(roc_auc_score(yt[m_], avg[n][1][m_])), 4)
+        if "THGT-Causal" in avg and "w/o Sibling enrollments" in avg:
+            _, _, _, pv = delong_test(yt[m_], avg["THGT-Causal"][1][m_], avg["w/o Sibling enrollments"][1][m_])
+            row["p (Causal vs w/o Sib)"] = pv
+        if "THGT-Causal" in avg and LGB_NAME in avg:
+            _, _, _, pv = delong_test(yt[m_], avg["THGT-Causal"][1][m_], avg[LGB_NAME][1][m_])
+            row["p (Causal vs LGB)"] = pv
+        sub_rows.append(row)
+    sub_df = pd.DataFrame(sub_rows)
+    sub_df.to_csv(os.path.join(tab_dir, "table6_subgroups.csv"), index=False)
+    to_latex(sub_df.set_index("subgroup"), os.path.join(tab_dir, "table6_subgroups.tex"),
+             "Subgroup AUC (seed-averaged predictions).", "tab:subgroups")
+
+    # per-course robustness
+    course_rows = []
+    crs_te = T["course"][te_rows]
+    if "THGT-Full" in avg and LGB_NAME in avg:
+        for c in np.unique(crs_te):
+            m_ = crs_te == c
+            if m_.sum() < 50 or yt[m_].min() == yt[m_].max():
+                continue
+            course_rows.append(dict(course=int(c), n=int(m_.sum()), dropout=float(yt[m_].mean()),
+                                    thgt_full=roc_auc_score(yt[m_], avg["THGT-Full"][1][m_]),
+                                    thgt_causal=roc_auc_score(yt[m_], avg["THGT-Causal"][1][m_]) if "THGT-Causal" in avg else np.nan,
+                                    lightgbm=roc_auc_score(yt[m_], avg[LGB_NAME][1][m_])))
+    course_df = pd.DataFrame(course_rows)
+    course_summary = {}
+    if len(course_df) >= 5:
+        from scipy.stats import wilcoxon
+        d_ = course_df.thgt_full - course_df.lightgbm
+        course_summary = dict(n_courses=len(course_df), thgt_full_wins=int((d_ > 0).sum()),
+                              mean_delta=float(d_.mean()), wilcoxon_p=float(wilcoxon(d_).pvalue),
+                              thgt_full_auc_mean=float(course_df.thgt_full.mean()),
+                              thgt_full_auc_std=float(course_df.thgt_full.std()),
+                              lgb_auc_mean=float(course_df.lightgbm.mean()), lgb_auc_std=float(course_df.lightgbm.std()))
+    course_df.to_csv(os.path.join(tab_dir, "table7_per_course.csv"), index=False)
+
+    # ---------------- Table 8: occlusion ----------------
+    occ_tables = {}
+    for e, df_ in OCC.items():
+        if len(df_) == 0:
+            continue
+        g_ = df_.groupby("occluded")["delta_auc"].agg(["mean", "std"]).sort_values("mean")
+        g_.columns = ["ΔAUC mean", "ΔAUC std"]
+        occ_tables[e] = g_
+        g_.to_csv(os.path.join(tab_dir, f"table8_occlusion_{e}.csv"))
+
+    # ---------------- attention (seed-averaged) ----------------
+    att_tables = {}
+    for e in [x for x in ("full", "causal") if x in exps]:
+        ta = [r["type_att"] for r in R[e] if "type_att" in r]
+        ea = [r["evt_att"] for r in R[e] if "evt_att" in r]
+        if ta:
+            att_tables[e] = (np.mean(ta, 0), np.std(ta, 0), np.mean(ea, 0), np.std(ea, 0))
+            pd.DataFrame(np.mean(ta, 0), columns=TYPE_NAMES, index=days).to_csv(os.path.join(tab_dir, f"attention_types_{e}.csv"))
+            pd.DataFrame(np.mean(ea, 0), columns=ACTS, index=days).to_csv(os.path.join(tab_dir, f"attention_events_{e}.csv"))
+
+    # ---------------- efficiency ----------------
+    eff = []
+    for e in exps:
+        eff.append(dict(model=EXPERIMENTS[e]["name"], params_M=float(R[e][0]["n_params"]) / 1e6,
+                        sec_per_epoch=float(np.mean([r.get("epoch_sec", np.nan) for r in R[e]])),
+                        infer_ms_per_1k=float(np.mean([r.get("infer_ms_per_1k", np.nan) for r in R[e]])),
+                        best_epoch=fmt(np.mean([float(r.get("best_epoch", np.nan)) for r in R[e]]), None, 1)))
+    eff_df = pd.DataFrame(eff)
+    eff_df.to_csv(os.path.join(tab_dir, "table9_efficiency.csv"), index=False)
+
+    # ---------------- report ----------------
+    def md(df, index=True):
+        d = df if index else df.set_index(df.columns[0])
+        return df_to_md(d.round(5) if hasattr(d, "round") else d)
+    with open(os.path.join(out, "results.md"), "w", encoding="utf-8") as f:
+        f.write("# THGT v4 — Results (KDD Cup 2015, test split)\n\n")
+        f.write(f"Seeds {seeds}; epochs {args.epochs}; EMA {args.ema}. Probabilities temperature-scaled on validation.\n\n")
+        f.write("## Dataset\n\n```\n" + json.dumps(ds_stats, indent=2) + "\n```\n\n")
+        f.write("## Table 1 — Main results\n\n" + df_to_md(main_df) + "\n\n")
+        f.write("## Table 2 — Calibration\n\n" + md(cal_df, False) + "\n\n")
+        if len(abl_df):
+            f.write("## Table 3 — Ablation\n\n" + md(abl_df, False) + "\n\n")
+        if len(sig_df):
+            f.write("## Table 4 — DeLong (Holm)\n\n" + md(sig_df, False) + "\n\n")
+        f.write("## Table 5 — Early warning\n\n" + md(ew_df) + "\n\n")
+        if len(sub_df):
+            f.write("## Table 6 — Subgroups\n\n" + md(sub_df, False) + "\n\n")
+        if course_summary:
+            f.write("## Table 7 — Per-course robustness (THGT-Full vs LightGBM)\n\n```\n" +
+                    json.dumps(course_summary, indent=2) + "\n```\n\n")
+        for e, g_ in occ_tables.items():
+            f.write(f"## Table 8 — Occlusion ({EXPERIMENTS[e]['name']})\n\n" + df_to_md(g_.round(5)) + "\n\n")
+        for e, (tm, tsd, em, esd) in att_tables.items():
+            f.write(f"## Attention ({EXPERIMENTS[e]['name']}, mean over seeds)\n\n" +
+                    df_to_md(pd.DataFrame(tm, columns=TYPE_NAMES, index=days).round(3)) + "\n\n" +
+                    df_to_md(pd.DataFrame(em, columns=ACTS, index=days).round(3)) + "\n\n")
+        f.write("## Table 9 — Efficiency\n\n" + md(eff_df, False) + "\n")
+    json.dump(dict(dataset=ds_stats, course_summary=course_summary, config=vars(args)),
+              open(os.path.join(out, "summary.json"), "w"), indent=2, default=str)
+
+    # ---------------- figures ----------------
+    try:
+        plt = set_pub_style()
+        from sklearn.decomposition import PCA
+        from sklearn.calibration import calibration_curve
+
+        fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+        for e in exps:
+            for r, s in zip(R[e], seeds):
+                h = pd.DataFrame(json.loads(str(r["history"])))
+                ax[0].plot(h.epoch, h.val_loss, alpha=.7, label=f"{e}-s{s}")
+                ax[1].plot(h.epoch, h.val_auc, alpha=.7)
+        ax[0].set_title("Validation loss (EMA weights)"); ax[1].set_title("Validation AUC")
+        ax[0].legend(fontsize=6, ncol=3)
+        fig.tight_layout(); save_figure(fig, os.path.join(fig_dir, "training_curves"))
+
+        if len(abl_df):
+            a_ = [np.mean([roc_auc_score(yt, r["test_p"]) for r in R[e]]) for e in ["causal", "no_graph", "no_hetero", "no_objects", "no_siblings"] if e in exps]
+            s_ = [np.std([roc_auc_score(yt, r["test_p"]) for r in R[e]]) for e in ["causal", "no_graph", "no_hetero", "no_objects", "no_siblings"] if e in exps]
+            fig = plt.figure(figsize=(7, 3.8))
+            plt.barh(abl_df.variant, a_, xerr=s_, color=["#C0392B"] + ["#5D6D7E"] * (len(a_) - 1), capsize=4)
+            plt.xlim(min(a_) - 0.01, max(a_) + 0.005); plt.gca().invert_yaxis()
+            plt.xlabel("Test AUC (mean ± std over seeds)"); plt.title("Ablation study")
+            fig.tight_layout(); save_figure(fig, os.path.join(fig_dir, "ablation"))
+
+        fig = plt.figure(figsize=(7, 4.5))
+        for name, v in ew_curves.items():
+            mu = np.array([a for a, _ in v]); sd = np.array([b for _, b in v])
+            plt.plot(days, mu, marker="o", label=name)
+            plt.fill_between(days, mu - sd, mu + sd, alpha=.15)
+        plt.xlabel("Course day d (only data ≤ d used)"); plt.ylabel("Test AUC")
+        plt.title("Early dropout warning"); plt.grid(alpha=.3); plt.legend(fontsize=8)
+        fig.tight_layout(); save_figure(fig, os.path.join(fig_dir, "early_warning"))
+
+        fig, ax = plt.subplots(1, 2, figsize=(11, 4.8))
+        for k, (store, ttl) in enumerate([(avg, "Before temperature scaling"), (avg_ts, "After temperature scaling")]):
+            ax[k].plot([0, 1], [0, 1], "k--", lw=1)
+            for name in [n for n in ["THGT-Full", "THGT-Causal", LGB_NAME, ENS_NAME] if n in store]:
+                tp = store[name][1]
+                fy, fx = calibration_curve(yt, tp, n_bins=12, strategy="quantile")
+                ax[k].plot(fx, fy, marker=".", label=f"{name[:28]} (ECE {ece_score(yt, tp):.3f})")
+            ax[k].set_title(ttl); ax[k].set_xlabel("Predicted probability"); ax[k].legend(fontsize=7)
+        ax[0].set_ylabel("Observed dropout rate")
+        fig.tight_layout(); save_figure(fig, os.path.join(fig_dir, "calibration"))
+
+        for e, g_ in occ_tables.items():
+            fig = plt.figure(figsize=(6.5, 4.2))
+            plt.barh(g_.index, g_["ΔAUC mean"], xerr=g_["ΔAUC std"].fillna(0), color="#2471A3", capsize=3)
+            plt.axvline(0, color="k", lw=.8); plt.xlabel("Δ test AUC when node type is masked")
+            plt.title(f"Occlusion importance — {EXPERIMENTS[e]['name']}")
+            fig.tight_layout(); save_figure(fig, os.path.join(fig_dir, f"occlusion_{e}"))
+
+        if "full" in att_tables or "causal" in att_tables:
+            e = "full" if "full" in att_tables else "causal"
+            tm, tsd, em, esd = att_tables[e]
+            fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+            for arr, sd_, nm, a, ttl in [(tm, tsd, TYPE_NAMES, ax[0], "Attention share by node type"),
+                                         (em, esd, ACTS, ax[1], "Attention share across event-type nodes")]:
+                im = a.imshow(arr.T, aspect="auto", cmap="viridis")
+                a.set_yticks(range(len(nm))); a.set_yticklabels(nm)
+                a.set_xticks(range(len(days))); a.set_xticklabels([f"d{x}" for x in days])
+                for i in range(arr.shape[0]):
+                    for j in range(arr.shape[1]):
+                        a.text(i, j, f"{arr[i, j]:.2f}\n±{sd_[i, j]:.2f}", ha="center", va="center", fontsize=5.5, color="w")
+                a.set_title(ttl + " (mean ± std, seeds)"); plt.colorbar(im, ax=a)
+            fig.tight_layout(); save_figure(fig, os.path.join(fig_dir, "attention_heatmaps"))
+
+        rz = [r for r in R.get("full", []) + R.get("causal", []) if "z" in r]
+        if rz:
+            Zt = rz[0]["z"].astype(np.float32); Zc = Zt - Zt.mean(0, keepdims=True)
+            n, S, d = Zc.shape
+            P = PCA(2, random_state=0).fit_transform(Zc.reshape(-1, d)).reshape(n, S, 2)
+            fig, ax = plt.subplots(1, 2, figsize=(12, 4.8))
+            for lab, c_, nm in [(0, "C0", "completed"), (1, "C3", "dropout")]:
+                m = P[yt == lab].mean(0)
+                ax[0].plot(m[:, 0], m[:, 1], "-o", color=c_, lw=2.5, label=nm)
+                for s_, dd in enumerate(days):
+                    ax[0].annotate(f"d{dd}", m[s_], fontsize=8, color=c_)
+            ax[0].set_title("Mean trajectory of learner position (PCA)"); ax[0].legend(); ax[0].grid(alpha=.3)
+            for rr_ in rz:
+                Z_ = rr_["z"].astype(np.float32); Z_ = Z_ - Z_.mean(0, keepdims=True)
+                sep = [np.linalg.norm(Z_[yt == 1, s_].mean(0) - Z_[yt == 0, s_].mean(0)) /
+                       (Z_[:, s_].std(0).mean() + 1e-6) for s_ in range(S)]
+                ax[1].plot(days, sep, marker="o", alpha=.6)
+            ax[1].set_xlabel("course day"); ax[1].set_ylabel("centroid distance / mean std")
+            ax[1].set_title("Class separation over time (all seeds)"); ax[1].grid(alpha=.3)
+            fig.tight_layout(); save_figure(fig, os.path.join(fig_dir, "position_trajectories"))
+
+        if len(course_df):
+            fig = plt.figure(figsize=(5, 5))
+            plt.scatter(course_df.lightgbm, course_df.thgt_full, s=course_df.n / 10, alpha=.7)
+            lo_ = min(course_df.lightgbm.min(), course_df.thgt_full.min()) - .01
+            plt.plot([lo_, 1], [lo_, 1], "k--", lw=1)
+            plt.xlabel("LightGBM AUC"); plt.ylabel("THGT-Full AUC"); plt.title("Per-course AUC (size ∝ n)")
+            fig.tight_layout(); save_figure(fig, os.path.join(fig_dir, "per_course"))
+    except Exception as ex:
+        import traceback; traceback.print_exc()
+        print("[figures] partially skipped:", ex)
+
+    pd.set_option("display.width", 250); pd.set_option("display.max_columns", 30)
+    print("\n" + "=" * 110 + "\nTABLE 1 — MAIN RESULTS (test, temperature-scaled)\n" + "=" * 110)
+    print(main_df.to_string())
+    print("\nTABLE 2 — CALIBRATION\n", cal_df.to_string(index=False))
+    if len(abl_df):
+        print("\nTABLE 3 — ABLATION\n", abl_df.round(5).to_string(index=False))
+    if len(sig_df):
+        print("\nTABLE 4 — DELONG (Holm)\n", sig_df.round(5).to_string(index=False))
+    print("\nTABLE 5 — EARLY WARNING\n", ew_df.to_string())
+    if len(sub_df):
+        print("\nTABLE 6 — SUBGROUPS\n", sub_df.round(5).to_string(index=False))
+    if course_summary:
+        print("\nTABLE 7 — PER-COURSE\n", course_summary)
+    for e, g_ in occ_tables.items():
+        print(f"\nTABLE 8 — OCCLUSION ({e})\n", g_.round(5).to_string())
+    print("\nTABLE 9 — EFFICIENCY\n", eff_df.to_string(index=False))
+    print(f"\n[done] outputs → {out}   (results.md, tables/, figures/)   total {(time.time()-T0)/60:.1f} min")
+
+
+if __name__ == "__main__":
+    main()
